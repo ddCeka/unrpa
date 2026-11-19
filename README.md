@@ -33,32 +33,32 @@ This standalone edition consolidates the original `unrpa` v2.3.0 multi-module pa
 
 ```bash
 # Extract an archive into the current directory
-python3 unrpa.py archive.rpa
+python3 unrpa archive.rpa
 
 # Extract into a specific folder (creating missing directories automatically)
-python3 unrpa.py -m -p ./extracted archive.rpa
+python3 unrpa -m -p ./extracted archive.rpa
 
 # Extract multiple archives at once using 8 worker threads
-python3 unrpa.py -j 8 -m -p ./extracted archive1.rpa archive2.rpa
+python3 unrpa -j 8 -m -p ./extracted archive1.rpa archive2.rpa
 
 # List all files in a flat list
-python3 unrpa.py -l archive.rpa
+python3 unrpa -l archive.rpa
 
 # Display archive contents as a directory tree
-python3 unrpa.py -t archive.rpa
+python3 unrpa -t archive.rpa
 ```
 
 ### Advanced & Recovery Options
 
 ```bash
 # Force a specific archive version if header auto-detection fails
-python3 unrpa.py -f RPA-3.0 archive.rpa
+python3 unrpa -f RPA-3.0 archive.rpa
 
 # Manually specify decimal offset and key values (including 0)
-python3 unrpa.py -o 123456 -k 987654321 archive.rpa
+python3 unrpa -o 123456 -k 987654321 archive.rpa
 
 # Continue extracting remaining files even if a single entry is corrupted
-python3 unrpa.py --continue-on-error archive.rpa
+python3 unrpa --continue-on-error archive.rpa
 ```
 
 ### CLI Reference
@@ -82,7 +82,7 @@ python3 unrpa.py --continue-on-error archive.rpa
 
 ## Summary of Changes vs. Original `unrpa` v2.3.0
 
-| Area | Original `unrpa` v2.3.0 | Patched `unrpa.py` | Impact |
+| Area | Original `unrpa` v2.3.0 | Patched `unrpa` | Impact |
 | :--- | :--- | :--- | :--- |
 | **Architecture** | Split across 9 package files (`meta.py`, `view.py`, `errors.py`, `versions/*.py`, etc.). | Consolidated into a single self-contained executable `.py` file. | Zero installation required; portable across systems. |
 | **ZiX Decompilation** | Required `uncompyle6`, which fails on Python 3.9+ bytecode. | Built-in binary constant scanner (`scan_pyo_constants`) that parses raw `.pyo` marshal tags directly. | Works on Python 3.14+ with zero third-party dependencies. |
