@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""unrpa: Extract files from Ren'Py archives (.rpa)."""
+
+from __future__ import annotations
+import argparse, builtins, concurrent.futures, io, itertools, os, pickle, shutil, struct, sys, threading, traceback, zlib
+from abc import ABCMeta, abstractmethod
+from pathlib import Path
+from typing import Any, BinaryIO, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple, Type, Union, cast
+
+APP_NAME = "unrpa"
+APP_VERSION = "2.3.0-patched"
+APP_DESCRIPTION = "Extract files from the RPA archive format (from the Ren'Py Visual Novel Engine)."
+
+SimpleIndexPart = Tuple[int, int]
+SimpleIndexEntry = Iterable[SimpleIndexPart]
+ComplexIndexPart = Tuple[int, int, bytes]
+ComplexIndexEntry = Sequence[ComplexIndexPart]
+IndexPart = Union[SimpleIndexPart, ComplexIndexPart]
+IndexEntry = Iterable[IndexPart]
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    # Blocks arbitrary code execution during index deserialization
+    SAFE_BUILTINS = frozenset({"dict", "list", "tuple", "bytes", "str", "int", "float", "bool"})
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "builtins" and name in self.SAFE_BUILTINS:
+            return getattr(builtins, name)
+        raise pickle.UnpicklingError(f"Blocked unsafe pickle global: {module}.{name}")
+
+
+def safe_unpickle(data: bytes) -> Any:
+    return RestrictedUnpickler(io.BytesIO(data), encoding="bytes").load()
+
+
+class ArchiveView(io.RawIOBase):
+    # Streams one or more archive segments seamlessly
+    def __init__(self, archive: BinaryIO, parts: ComplexIndexEntry) -> None:
+        self.archive = archive
+        self.name = getattr(archive, "name", "<archive>")
+        self.segments: List[Tuple[Optional[io.BytesIO], int, int]] = []
+        self.remaining = 0
+
+        for offset, length, prefix in parts:
+            if prefix:
+                self.segments.append((io.BytesIO(prefix), 0, len(prefix)))
+                self.remaining += len(prefix)
+            body_length = max(0, length - len(prefix))
+            if body_length > 0:
+                self.segments.append((None, offset, body_length))
+                self.remaining += body_length
+
+        self._current_offset: Optional[int] = None
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, amount: int = -1) -> bytes:
+        if amount < 0 or amount > self.remaining:
+            amount = self.remaining
+        if amount == 0 or not self.segments:
+            return b""
+
+        chunks: List[bytes] = []
+        while amount > 0 and self.segments:
+            buf, offset, seg_remaining = self.segments[0]
+            to_read = min(amount, seg_remaining)
+
+            if buf is not None:
+                data = buf.read(to_read)
+            else:
+                if self._current_offset != offset:
+                    self.archive.seek(offset)
+                data = self.archive.read(to_read)
+                self._current_offset = offset + len(data)
+
+            if not data:
+                raise EOFError("End of archive reached before the file should end.")
+
+            read_len = len(data)
+            chunks.append(data)
+            amount -= read_len
+            self.remaining -= read_len
+            seg_remaining -= read_len
+
+            if seg_remaining == 0:
+                self.segments.pop(0)
+                self._current_offset = None
+            else:
+                self.segments[0] = (buf, offset + read_len, seg_remaining)
+
+        return b"".join(chunks)
+
+    def read1(self, amount: int = -1) -> bytes:
+        return self.read(amount)
+
+
+class UnRPAError(Exception):
+    def __init__(self, message: str, cmd_line_help: Optional[str] = None) -> None:
+        self.message = message
+        self.cmd_line_help = cmd_line_help
+        super().__init__(message)
+
+
+class OutputDirectoryNotFoundError(UnRPAError):
+    def __init__(self, path: Union[str, Path]) -> None:
+        super().__init__(f"The given output directory ({path}) does not exist.", "If you want to create it, use --mkdir.")
+
+
+class UnknownArchiveError(UnRPAError):
+    def __init__(self, header: bytes) -> None:
+        decoded = header.decode("utf-8", "replace").strip()
+        super().__init__(
+            f"Auto-detection failed—unsupported archive version. Header: “{decoded}”",
+            "You can try using --force to force a specific version rather than relying on auto-detection.",
+        )
+
+
+class AmbiguousArchiveError(UnRPAError):
+    def __init__(self, detected: Set[Version]) -> None:
+        detected_list = ", ".join(str(v) for v in detected)
+        super().__init__(
+            f"Auto-detection failed because version is ambiguous: {detected_list}.",
+            "You can try using --force to force these versions and see what works.",
+        )
+
+
+class ErrorExtractingFile(UnRPAError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "There was an error while trying to extract a file from the archive.",
+            f"Use --continue-on-error to extract as much as possible.\nError Detail: {detail}",
+        )
+
+
+class PathTraversalError(UnRPAError):
+    def __init__(self, target_path: str) -> None:
+        super().__init__(f"Security error: Archive attempted path traversal ({target_path}).")
+
+
+class VersionSpecificRequirementUnmetError(UnRPAError):
+    pass
+
+
+class LoaderRequiredError(VersionSpecificRequirementUnmetError):
+    def __init__(self, path: Union[str, Path]) -> None:
+        super().__init__(
+            f"Extracting ZiX archives requires “loader.pyo” alongside the archive (expected at “{path}”).",
+            "Copy “loader.pyo” from the game's “renpy” directory next to the archive.",
+        )
+
+
+class IncorrectLoaderError(VersionSpecificRequirementUnmetError):
+    def __init__(self) -> None:
+        super().__init__("The provided “loader.pyo” file does not match the game this archive came from.")
+
+
+class Version(metaclass=ABCMeta):
+    # Abstract base class for RPA format versions
+    name: str
+
+    @abstractmethod
+    def detect(self, extension: str, first_line: bytes) -> bool:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        raise NotImplementedError()
+
+    def postprocess(self, source: ArchiveView, sink: BinaryIO) -> None:
+        shutil.copyfileobj(source, sink)
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class ExtensionBasedVersion(Version, metaclass=ABCMeta):
+    extension: str
+
+    def detect(self, extension: str, first_line: bytes) -> bool:
+        return extension == self.extension
+
+
+class HeaderBasedVersion(Version, metaclass=ABCMeta):
+    header: bytes
+
+    def detect(self, extension: str, first_line: bytes) -> bool:
+        return first_line.startswith(self.header)
+
+
+class RPA1(ExtensionBasedVersion):
+    name = "RPA-1.0"
+    extension = ".rpi"
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        return 0, None
+
+
+class RPA2(HeaderBasedVersion):
+    name = "RPA-2.0"
+    header = b"RPA-2.0"
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        return int(archive.readline()[8:], 16), None
+
+
+class RPA3(HeaderBasedVersion):
+    name = "RPA-3.0"
+    header = b"RPA-3.0"
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        parts = archive.readline().split()
+        return int(parts[1], 16), int(parts[2], 16)
+
+
+class ALT1(HeaderBasedVersion):
+    name = "ALT-1.0"
+    header = b"ALT-1.0"
+    extra_key = 0xDABE8DF0
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        parts = archive.readline().split()
+        return int(parts[2], 16), int(parts[1], 16) ^ ALT1.extra_key
+
+
+class RPA32(RPA3):
+    name = "RPA-3.2"
+    header = b"RPA-3.2"
+
+
+class RPA40(RPA3):
+    name = "RPA-4.0"
+    header = b"RPA-4.0"
+
+
+# ZiX proprietary obfuscation & version-independent .pyo scanner (Python 3.14+ safe)
+LOADER_NAME = "loader.pyo"
+MAGIC_KEYS = (
+    3621826839565189698, 8167163782024462963, 5643161164948769306,
+    4940859562182903807, 2672489546482320731, 8917212212349173728,
+    7093854916990953299,
+)
+
+
+def obfuscation_sha1(code: str) -> int:
+    a = int("".join(filter(str.isdigit, code))) + 102464652121606009
+    return int(round(a ** (1 / 3)) / 23 * 109)
+
+
+def obfuscation_offset(value: bytes) -> int:
+    return int(value[7:5:-1] + value[:3] + value[5:2:-1], 16)
+
+
+def obfuscation_run(s: bytes, key: int) -> bytes:
+    fmt = f"<{'Q' * (len(s) // 8)}"
+    decoded = (mk ^ key ^ part for mk, part in zip(itertools.cycle(MAGIC_KEYS), struct.unpack(fmt, s)))
+    return struct.pack(fmt, *decoded)
+
+
+def scan_pyo_constants(data: bytes) -> Tuple[List[str], List[int]]:
+    # Version-independent binary scanner for Python 2.7 / 3.x .pyo marshal streams
+    strings: List[str] = []
+    ints: List[int] = []
+    refs: List[Any] = []
+    n = len(data)
+
+    for start in (8, 12, 16):
+        if start >= n:
+            continue
+        pos = start
+        strings.clear()
+        ints.clear()
+        refs.clear()
+
+        while pos < n:
+            raw_tag = data[pos]
+            pos += 1
+            flagged = bool(raw_tag & 0x80)
+            tag = raw_tag & 0x7F
+
+            if tag == 0x69:  # TYPE_INT ('i')
+                if pos + 4 <= n:
+                    val = struct.unpack_from("<i", data, pos)[0]
+                    pos += 4
+                    ints.append(val)
+                    if flagged:
+                        refs.append(val)
+            elif tag in (0x73, 0x74, 0x75):  # TYPE_STRING ('s'), TYPE_INTERNED ('t'), TYPE_UNICODE ('u')
+                if pos + 4 <= n:
+                    length = struct.unpack_from("<I", data, pos)[0]
+                    pos += 4
+                    if 0 <= length <= n - pos:
+                        s = data[pos : pos + length].decode("utf-8", "replace")
+                        pos += length
+                        strings.append(s)
+                        if flagged or tag == 0x74:
+                            refs.append(s)
+            elif tag in (0x7A, 0x5A):  # TYPE_SHORT_ASCII ('z'), TYPE_SHORT_ASCII_INTERNED ('Z')
+                if pos < n:
+                    length = data[pos]
+                    pos += 1
+                    if pos + length <= n:
+                        s = data[pos : pos + length].decode("latin-1")
+                        pos += length
+                        strings.append(s)
+                        if flagged or tag == 0x5A:
+                            refs.append(s)
+            elif tag == 0x72:  # TYPE_REF ('r')
+                if pos + 4 <= n:
+                    idx = struct.unpack_from("<I", data, pos)[0]
+                    pos += 4
+                    if 0 <= idx < len(refs) and isinstance(refs[idx], str):
+                        strings.append(refs[idx])
+            elif tag == 0x52:  # TYPE_STRINGREF ('R', Python 2.7)
+                if pos + 4 <= n:
+                    idx = struct.unpack_from("<I", data, pos)[0]
+                    pos += 4
+                    if 0 <= idx < len(refs) and isinstance(refs[idx], str):
+                        strings.append(refs[idx])
+
+        if "verificationcode" in strings and "sha1" in strings:
+            return strings, ints
+
+    return strings, ints
+
+
+def inspect_zix_loader(archive: BinaryIO, need_read_len: bool = False) -> Tuple[int, Optional[int]]:
+    # Extracts ZiX verificationcode key and optional read length without version-locked marshal
+    loader_path = Path(getattr(archive, "name", ".")).parent / LOADER_NAME
+    if not loader_path.is_file():
+        raise LoaderRequiredError(loader_path)
+
+    strings, ints = scan_pyo_constants(loader_path.read_bytes())
+    vc_str: Optional[str] = None
+    read_len: Optional[int] = None
+
+    for idx, val in enumerate(strings):
+        if val == "sha1":
+            for offset in (-2, -1, 1, 2):
+                cand_idx = idx + offset
+                if 0 <= cand_idx < len(strings):
+                    cand = strings[cand_idx]
+                    if cand not in ("verificationcode", "sha1", "_string", "run", "read", "rv") and len(cand) >= 4:
+                        vc_str = cand
+                        break
+            if vc_str:
+                break
+
+    if not vc_str:
+        digit_heavy = [s for s in strings if sum(c.isdigit() for c in s) >= 4 and len(s) <= 128]
+        if digit_heavy:
+            vc_str = digit_heavy[0]
+
+    if not vc_str:
+        raise IncorrectLoaderError()
+
+    if need_read_len:
+        positive_ints = [i for i in ints if 8 <= i <= 10_485_760 and i % 8 == 0]
+        if positive_ints:
+            read_len = positive_ints[0]
+        else:
+            raise IncorrectLoaderError()
+
+    return obfuscation_sha1(vc_str), read_len
+
+
+def find_zix_offset(archive: BinaryIO) -> int:
+    return obfuscation_offset(archive.readline().split()[-1])
+
+
+class ZiX12A(HeaderBasedVersion):
+    name = "ZiX-12A"
+    header = b"ZiX-12A"
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        key, _ = inspect_zix_loader(archive, need_read_len=False)
+        return find_zix_offset(archive), key
+
+
+class ZiX12B(HeaderBasedVersion):
+    name = "ZiX-12B"
+    header = b"ZiX-12B"
+
+    def __init__(self) -> None:
+        self.details: Optional[Tuple[int, int]] = None
+
+    def find_offset_and_key(self, archive: BinaryIO) -> Tuple[int, Optional[int]]:
+        key, amount = inspect_zix_loader(archive, need_read_len=True)
+        assert amount is not None
+        self.details = (key, amount)
+        return find_zix_offset(archive), key
+
+    def postprocess(self, source: ArchiveView, sink: BinaryIO) -> None:
+        if not self.details:
+            raise RuntimeError("find_offset_and_key must be called before postprocess")
+        key, amount = self.details
+        parts = []
+        while amount > 0:
+            part = source.read(amount)
+            if not part:
+                break
+            amount -= len(part)
+            parts.append(part)
+        sink.write(obfuscation_run(b"".join(parts), key))
+        shutil.copyfileobj(source, sink)
+
+
+class TreeNode:
+    def __init__(self, name: str, children: Iterable[Sequence[str]]) -> None:
+        self.name = name
+        self.children = [
+            TreeNode(child, [sub[1:] for sub in grp if len(sub) > 1])
+            for child, grp in itertools.groupby(children, key=operator.itemgetter(0))
+        ] if children else []
+
+
+class UnRPA:
+    # Core RPA extraction and inspection controller
+    name = APP_NAME
+    error, info, debug = 0, 1, 2
+    ordered_versions: Tuple[Type[Version], ...] = (RPA1, RPA2, RPA3, ALT1, ZiX12A, ZiX12B, RPA32, RPA40)
+    provided_versions: FrozenSet[Type[Version]] = frozenset(ordered_versions)
+
+    def __init__(
+        self,
+        filename: Union[str, Path],
+        verbosity: int = -1,
+        path: Optional[Union[str, Path]] = None,
+        mkdir: bool = False,
+        version: Optional[Type[Version]] = None,
+        continue_on_error: bool = False,
+        offset_and_key: Optional[Tuple[int, int]] = None,
+        extra_versions: FrozenSet[Type[Version]] = frozenset(),
+        jobs: Optional[int] = None,
+    ) -> None:
+        self.verbose = verbosity
+        self.path = Path(path).resolve() if path else Path.cwd().resolve()
+        self.mkdir = mkdir
+        self.version = version
+        self.archive = Path(filename)
+        self.continue_on_error = continue_on_error
+        self.offset_and_key = offset_and_key
+        self.tty = sys.stdout.isatty()
+        self.versions = UnRPA.provided_versions | extra_versions
+        self.jobs = max(1, jobs) if jobs is not None else min(32, (os.cpu_count() or 1) + 4)
+        self._log_lock = threading.Lock()
+
+    def log(self, verbosity: int, human_message: str, machine_message: Optional[str] = None) -> None:
+        if self.verbose > verbosity:
+            msg = human_message if self.tty else (machine_message or human_message)
+            with self._log_lock:
+                print(msg, file=sys.stderr if verbosity == UnRPA.error else sys.stdout)
+
+    def _resolve_safe_output_path(self, relative_path: str) -> Path:
+        # Prevents Zip Slip path traversal outside destination directory
+        target = (self.path / relative_path).resolve()
+        if self.path != target and self.path not in target.parents:
+            raise PathTraversalError(relative_path)
+        return target
+
+    def extract_files(self) -> None:
+        self.log(UnRPA.error, f"Extracting files from {self.archive}.")
+        if self.mkdir:
+            self.make_directory_structure(self.path)
+        if not self.path.is_dir():
+            raise OutputDirectoryNotFoundError(self.path)
+
+        version = self.version() if self.version else self.detect_version()
+        with self.archive.open("rb") as archive:
+            index = self.get_index(archive, version)
+
+        total_files = len(index)
+        if total_files == 0:
+            return
+
+        # Pre-validate destination paths and create unique parent directories upfront
+        tasks: List[Tuple[str, ComplexIndexEntry, Path]] = []
+        unique_dirs: Set[Path] = set()
+        for rel_path, data in index.items():
+            try:
+                out_path = self._resolve_safe_output_path(rel_path)
+                tasks.append((rel_path, data, out_path))
+                unique_dirs.add(out_path.parent)
+            except BaseException as error:
+                if self.continue_on_error:
+                    self.log(UnRPA.error, f"Error preparing {rel_path}, continuing. Detail: {traceback.format_exc()}.")
+                else:
+                    raise ErrorExtractingFile(traceback.format_exc()) from error
+
+        for directory in sorted(unique_dirs):
+            self.make_directory_structure(directory)
+
+        thread_local = threading.local()
+        open_handles: List[BinaryIO] = []
+        handles_lock = threading.Lock()
+        completed = 0
+        progress_lock = threading.Lock()
+
+        def get_thread_archive() -> BinaryIO:
+            handle = getattr(thread_local, "archive", None)
+            if handle is None:
+                handle = self.archive.open("rb")
+                thread_local.archive = handle
+                with handles_lock:
+                    open_handles.append(handle)
+            return handle
+
+        def worker(item: Tuple[str, ComplexIndexEntry, Path]) -> None:
+            nonlocal completed
+            rel_path, data, output_path = item
+            try:
+                with progress_lock:
+                    idx = completed
+                    completed += 1
+                file_view = self.extract_file(rel_path, data, idx, total_files, get_thread_archive())
+                with output_path.open("wb") as output_file:
+                    version.postprocess(file_view, output_file)
+            except BaseException as error:
+                if self.continue_on_error:
+                    self.log(UnRPA.error, f"Error extracting {rel_path}, continuing. Detail: {traceback.format_exc()}.")
+                else:
+                    raise ErrorExtractingFile(traceback.format_exc()) from error
+
+        worker_count = min(self.jobs, len(tasks))
+        try:
+            if worker_count == 1:
+                for task in tasks:
+                    worker(task)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+                    futures = [pool.submit(worker, task) for task in tasks]
+                    for fut in concurrent.futures.as_completed(futures):
+                        fut.result()
+        finally:
+            for handle in open_handles:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    def list_files(self) -> None:
+        self.log(UnRPA.info, f"Listing files in {self.archive}:")
+        with self.archive.open("rb") as archive:
+            paths = self.get_index(archive).keys()
+        for path in sorted(paths):
+            print(path)
+
+    def list_files_tree(self) -> None:
+        print(self.archive)
+        for line in self.tree_lines():
+            print(line)
+
+    def tree(self) -> TreeNode:
+        with self.archive.open("rb") as archive:
+            paths = sorted(self.get_index(archive).keys())
+        return TreeNode(str(self.archive), [list(Path(p).parts) for p in paths])
+
+    def tree_lines(self, current_node: Optional[TreeNode] = None, prefix: str = "") -> Iterable[str]:
+        if not current_node:
+            current_node = self.tree()
+        for child in current_node.children[:-1]:
+            yield f"{prefix}├--- {child.name}"
+            yield from self.tree_lines(child, f"{prefix}|    ")
+        if current_node.children:
+            child = current_node.children[-1]
+            yield f"{prefix}└--- {child.name}"
+            yield from self.tree_lines(child, f"{prefix}     ")
+
+    def extract_file(self, name: str, data: ComplexIndexEntry, file_number: int, total_files: int, archive: BinaryIO) -> ArchiveView:
+        pct = (file_number / float(total_files)) if total_files else 1.0
+        self.log(UnRPA.info, f"[{pct:06.2%}] {name}", name)
+        return ArchiveView(archive, data)
+
+    def make_directory_structure(self, directory: Path) -> None:
+        self.log(UnRPA.debug, f"Creating directory structure: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def get_index(self, archive: BinaryIO, version: Optional[Version] = None) -> Dict[str, ComplexIndexEntry]:
+        if not version:
+            version = self.version() if self.version else self.detect_version()
+        offset, key = self.offset_and_key if self.offset_and_key is not None else version.find_offset_and_key(archive)
+
+        archive.seek(offset)
+        index: Dict[bytes, IndexEntry] = safe_unpickle(zlib.decompress(archive.read()))
+        normal_index = UnRPA.deobfuscate_index(key, index) if key is not None else UnRPA.normalise_index(index)
+        return {UnRPA.ensure_str_path(p).replace("/", os.sep): d for p, d in normal_index.items()}
+
+    def detect_version(self) -> Version:
+        potential = (v() for v in self.versions)
+        ext = self.archive.suffix.lower()
+        with self.archive.open("rb") as f:
+            header = f.readline()
+            detected = {v for v in potential if v.detect(ext, header)}
+            if len(detected) > 1:
+                raise AmbiguousArchiveError(detected)
+            try:
+                return next(iter(detected))
+            except StopIteration:
+                raise UnknownArchiveError(header)
+
+    @staticmethod
+    def ensure_str_path(path: Union[str, bytes]) -> str:
+        return path if isinstance(path, str) else path.decode("utf-8", "replace")
+
+    @staticmethod
+    def deobfuscate_index(key: int, index: Dict[bytes, IndexEntry]) -> Dict[bytes, ComplexIndexEntry]:
+        return {p: UnRPA.deobfuscate_entry(key, e) for p, e in index.items()}
+
+    @staticmethod
+    def deobfuscate_entry(key: int, entry: IndexEntry) -> ComplexIndexEntry:
+        return [(offset ^ key, length ^ key, start) for offset, length, start in UnRPA.normalise_entry(entry)]
+
+    @staticmethod
+    def normalise_index(index: Dict[bytes, IndexEntry]) -> Dict[bytes, ComplexIndexEntry]:
+        return {p: UnRPA.normalise_entry(e) for p, e in index.items()}
+
+    @staticmethod
+    def normalise_entry(entry: IndexEntry) -> ComplexIndexEntry:
+        return [(*cast(SimpleIndexPart, p), b"") if len(p) == 2 else cast(ComplexIndexPart, p) for p in entry]
+
+
+def main() -> None:
+    # CLI argument parsing and execution
+    parser = argparse.ArgumentParser(prog=APP_NAME, description=APP_DESCRIPTION)
+    parser.add_argument("-v", "--verbose", action="count", dest="verbose", default=1, help="increase verbosity (default: 1).")
+    parser.add_argument("-s", "--silent", action="store_const", const=0, dest="verbose", help="no non-essential output.")
+
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument("-l", "--list", action="store_const", const="list", dest="action", help="list archive contents.")
+    action_group.add_argument("-t", "--tree", action="store_const", const="tree", dest="action", help="list contents as a tree.")
+
+    parser.add_argument("-p", "--path", type=str, default=None, help="extract files to path (default: current directory).")
+    parser.add_argument("-m", "--mkdir", action="store_true", default=False, help="create missing directories in extraction path.")
+    parser.add_argument("-j", "--jobs", type=int, default=None, help="number of parallel extraction worker threads.")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
+
+    adv = parser.add_argument_group("advanced arguments", "Options for unsupported or damaged archives.")
+    adv.add_argument("--continue-on-error", action="store_true", default=False, help="continue extraction on error.")
+    adv.add_argument(
+        "-f", "--force", type=str, dest="version", default=None,
+        help="force archive version: " + ", ".join(v.name for v in UnRPA.ordered_versions) + ".",
+    )
+    adv.add_argument("-o", "--offset", type=int, default=None, help="override archive header offset.")
+    adv.add_argument("-k", "--key", type=int, default=None, help="override archive header key.")
+    parser.add_argument("files", metavar="FILENAME", type=str, nargs="+", help="archive(s) to extract.")
+
+    args = parser.parse_args()
+
+    provided_version: Optional[Type[Version]] = None
+    if args.version:
+        try:
+            provided_version = next(v for v in UnRPA.provided_versions if args.version.lower() == v.name.lower())
+        except StopIteration:
+            parser.error("Unrecognised version. Must be one of: " + ", ".join(v.name for v in UnRPA.ordered_versions))
+
+    provided_offset_and_key: Optional[Tuple[int, int]] = None
+    if args.key is not None and args.offset is not None:
+        provided_offset_and_key = (args.offset, args.key)
+    elif (args.key is not None) != (args.offset is not None):
+        parser.error("If you set --key or --offset, you must set both.")
+
+    if args.action and args.path:
+        parser.error("Option --path: only valid when extracting.")
+    if args.mkdir and not args.path:
+        parser.error("Option --mkdir: only valid when --path is set.")
+    if not args.mkdir and args.path and not Path(args.path).is_dir():
+        parser.error(f"No such directory: “{args.path}”. Use --mkdir to create it.")
+
+    for filename in args.files:
+        file_path = Path(filename)
+        if not file_path.is_file():
+            parser.error(f"No such file: “{filename}”.")
+        try:
+            extractor = UnRPA(
+                file_path, args.verbose, args.path, args.mkdir,
+                provided_version, args.continue_on_error, provided_offset_and_key,
+                jobs=args.jobs,
+            )
+            if args.action == "list":
+                extractor.list_files()
+            elif args.action == "tree":
+                extractor.list_files_tree()
+            else:
+                extractor.extract_files()
+        except UnRPAError as error:
+            help_msg = f"\n{error.cmd_line_help}" if error.cmd_line_help else ""
+            sys.exit(f"\n\033[31m{error.message}{help_msg}\033[0m")
+
+
+if __name__ == "__main__":
+    main()
